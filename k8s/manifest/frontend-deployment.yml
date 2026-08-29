@@ -33,7 +33,7 @@ metadata:
   name: frontend
   namespace: jerney
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: frontend
   ports:
