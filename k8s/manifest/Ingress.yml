@@ -3,7 +3,6 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: jerney-ingress
-  namespace: jerney
 spec:
   ingressClassName: nginx
   rules:
