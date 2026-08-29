@@ -1,0 +1,151 @@
+name: Jerney CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_BACKEND_REPO: jerney-backend
+  ECR_FRONTEND_REPO: jerney-frontend
+  EKS_CLUSTER: jerney-eks-cluster
+
+jobs:
+  # ============================
+  # STAGE 1: Build, Scan, Push
+  # ============================
+  build-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Backend Image
+        run: docker build -t ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_BACKEND_REPO }}:${{ github.sha }} ./backend
+
+      - name: Build Frontend Image
+        run: docker build -t ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_FRONTEND_REPO }}:${{ github.sha }} ./frontend
+
+      - name: Trivy Scan - Backend
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_BACKEND_REPO }}:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 1   # agar CRITICAL/HIGH vulnerability mile, pipeline yahan fail ho jayegi
+
+      - name: Trivy Scan - Frontend
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_FRONTEND_REPO }}:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
+      - name: Push Backend Image
+        run: docker push ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_BACKEND_REPO }}:${{ github.sha }}
+
+      - name: Push Frontend Image
+        run: docker push ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_FRONTEND_REPO }}:${{ github.sha }}
+
+  # ============================
+  # STAGE 2: Deploy to Testing
+  # ============================
+  deploy-testing:
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    environment: testing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+      - name: Deploy to testing namespace
+        run: |
+          sed -i "s|IMAGE_TAG|${{ github.sha }}|g; s|ACCOUNT_ID|${{ secrets.AWS_ACCOUNT_ID }}|g" k8s/manifest/*.yml
+          kubectl apply -f k8s/manifest/ -n jerney-testing
+
+  # ============================
+  # STAGE 3: Deploy to Staging
+  # ============================
+  deploy-staging:
+    needs: deploy-testing
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+      - name: Deploy to staging namespace
+        run: |
+          sed -i "s|IMAGE_TAG|${{ github.sha }}|g; s|ACCOUNT_ID|${{ secrets.AWS_ACCOUNT_ID }}|g" k8s/manifest/*.yml
+          kubectl apply -f k8s/manifest/ -n jerney-staging
+
+  # ============================
+  # STAGE 4: Deploy to Production
+  # ============================
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Deploy to production namespace
+        run: |
+          sed -i "s|IMAGE_TAG|${{ github.sha }}|g; s|ACCOUNT_ID|${{ secrets.AWS_ACCOUNT_ID }}|g" k8s/manifest/*.yml
+          kubectl apply -f k8s/manifest/ -n jerney-production
+
+      - name: Wait for rollout to complete
+        id: rollout-check
+        continue-on-error: true
+        run: |
+          kubectl rollout status deployment/backend -n jerney-production --timeout=120s
+          kubectl rollout status deployment/frontend -n jerney-production --timeout=120s
+
+      - name: Health check
+        id: health-check
+        if: steps.rollout-check.outcome == 'success'
+        continue-on-error: true
+        run: |
+          sleep 10
+          kubectl run curl-test --rm -i --restart=Never -n jerney-production \
+            --image=curlimages/curl -- curl -sf http://jerney-backend:5000/api/health
+
+      - name: Rollback on failure
+        if: steps.rollout-check.outcome == 'failure' || steps.health-check.outcome == 'failure'
+        run: |
+          echo "Deployment or health check failed — rolling back!"
+          kubectl rollout undo deployment/backend -n jerney-production
+          kubectl rollout undo deployment/frontend -n jerney-production
+          kubectl rollout status deployment/backend -n jerney-production
+          kubectl rollout status deployment/frontend -n jerney-production
+          exit 1   # pipeline ko bhi "failed" mark karo, taaki team ko pata chale rollback hua
+
+      - name: Deployment successful
+        if: steps.rollout-check.outcome == 'success' && steps.health-check.outcome == 'success'
+        run: echo "✅ Production deployment successful and healthy!"
