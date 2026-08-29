@@ -58,6 +58,7 @@ jobs:
           ignore-unfixed: true
           exit-code: 1
           trivyignores: backend/.trivyignore
+          #comment
 
       # ============================
       # Trivy Frontend Scan
